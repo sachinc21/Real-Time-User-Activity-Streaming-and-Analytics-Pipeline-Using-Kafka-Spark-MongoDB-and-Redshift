@@ -1,0 +1,2 @@
+# Real-Time-User-Activity-Streaming-and-Analytics-Pipeline-Using-Kafka-Spark-MongoDB-and-Redshift
+Here’s a concise description under 350 characters:  Real-time ETL pipeline streaming user activity data via Kafka, transforming it with Spark Structured Streaming. Stores raw data in MongoDB for fast lookups and loads transformed data into AWS Redshift for analytics. Demonstrates a scalable, end-to-end streaming solution for user behavior insights.
