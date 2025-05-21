@@ -1,79 +1,84 @@
-# Real-Time-User-Activity-Streaming-and-Analytics-Pipeline-Using-Kafka-Spark-MongoDB-and-Redshift
-
-Real-time ETL pipeline streaming user activity data via Kafka, transforming it with Spark Structured Streaming. Stores raw data in MongoDB for fast lookups and loads transformed data into AWS Redshift for analytics. Demonstrates a scalable, end-to-end streaming solution for user behavior insights.
-
 # Real-Time Data Engineering Project – Streaming ETL Pipeline
 
 ## 🚀 Project Overview  
-This project implements a real-time streaming ETL pipeline to ingest, process, and store user activity data. Data is produced to Kafka, processed and transformed using Apache Spark Structured Streaming, raw data is stored in MongoDB, and aggregated data is loaded into AWS Redshift for analytics. This setup enables real-time insights into user behavior.
+This project implements a real-time streaming ETL pipeline to ingest, process, and store user activity data. Data is produced to Kafka, processed and transformed using Apache Spark Structured Streaming, and the cleaned data is written into both MongoDB and AWS Redshift for analytics and storage.
 
 ## 🛠️ Tech Stack  
-- **Apache Kafka:** Distributed messaging system for data ingestion  
-- **Apache Spark Structured Streaming:** Real-time data processing and transformations  
-- **MongoDB:** NoSQL database for raw data storage and fast lookups  
-- **AWS Redshift:** Data warehouse for analytics and reporting  
-- **Python:** Kafka producer and pipeline orchestration  
+- **Apache Kafka:** Distributed messaging system for ingesting user activity events  
+- **Apache Spark Structured Streaming:** Real-time processing and transformation  
+- **MongoDB:** NoSQL database for storing structured and semi-structured data  
+- **AWS Redshift:** Data warehouse for analytical queries and reporting  
+- **Python:** Used for the Kafka producer and Spark streaming logic  
+
 
 ## ✅ Architecture  
-The pipeline follows the typical ETL pattern:  
-- **Extract:** Simulated user activity JSON data streamed into Kafka topics  
-- **Transform:** Spark streaming job reads Kafka, parses JSON, applies cleaning and enrichment  
-- **Load:** Raw data written to MongoDB; transformed data loaded into Redshift  
 
-### 📌 Data Flow Overview:  
-1. **Data Ingestion:** Kafka producer sends user activity events to Kafka cluster.  
-2. **Stream Processing:** Spark Structured Streaming consumes Kafka data, performs transformations.  
-3. **Storage:**  
-   - Raw data saved in MongoDB collections for quick querying.  
-   - Aggregated and cleaned data loaded into Redshift tables for SQL analytics.  
-4. **Analytics:** Query Redshift to derive insights such as user activity trends and device usage.
+### 📌 Data Flow:
+1. **Kafka Producer:** Sends real-time user activity JSON events to the Kafka topic `user_activity`.
+2. **Spark Streaming:** Reads messages from Kafka, parses and transforms the data.
+3. **Data Storage:**  
+   - Transformed data is written to both **MongoDB** and **Redshift**.
+
+---
 
 ## 🔨 Implementation Steps  
 
 ### Step 1: Kafka Data Producer  
-- Generate and send user activity JSON events continuously to Kafka topics.
+Simulate and send real-time events to Kafka.
 
-### Step 2: Spark Streaming Processing  
-- Read Kafka topic data using Spark Structured Streaming.  
-- Parse JSON and apply transformations like filtering, enrichment.  
-- Write raw data to MongoDB and transformed data to Redshift.
+### Step 2: Spark Structured Streaming ETL  
 
-### Step 3: Data Storage and Querying  
-- Verify raw events in MongoDB collections.  
-- Use SQL queries on Redshift to analyze user behavior.
+```python
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import from_json, col
+from pyspark.sql.types import StructType, StructField, StringType, TimestampType
 
----
+# Initialize SparkSession
+spark = SparkSession.builder \
+    .appName("StreamingETLPipeline") \
+    .getOrCreate()
 
-## 📸 Screenshots  
+# Define schema for incoming JSON
+schema = StructType([
+    StructField("user_id", StringType()),
+    StructField("activity_type", StringType()),
+    StructField("device", StringType()),
+    StructField("timestamp", TimestampType())
+])
 
-### 1. Architecture Diagram  
-![Architecture](./screenshots/architecture_diagram.png)  
+# Read data from Kafka
+kafka_df = spark.readStream \
+    .format("kafka") \
+    .option("kafka.bootstrap.servers", "localhost:9092") \
+    .option("subscribe", "user_activity") \
+    .option("startingOffsets", "latest") \
+    .load()
 
-### 2. Kafka Producer Output  
-![Kafka Producer Console](./screenshots/kafka_producer_output.png)  
+# Parse JSON from Kafka message value
+parsed_df = kafka_df.selectExpr("CAST(value AS STRING)") \
+    .select(from_json(col("value"), schema).alias("data")) \
+    .select("data.*")
 
-### 3. Spark Streaming Logs  
-![Spark Streaming Console](./screenshots/spark_streaming_output.png)  
+# Example transformation: keep only login events
+transformed_df = parsed_df.filter(col("activity_type") == "login")
 
-### 4. MongoDB Sample Data  
-![MongoDB Data](./screenshots/mongodb_sample.png)  
+# Write transformed data to MongoDB
+mongo_query = transformed_df.writeStream \
+    .format("mongodb") \
+    .option("uri", "mongodb://localhost:27017/streamingdb.login_events") \
+    .outputMode("append") \
+    .start()
 
-### 5. AWS Redshift Query Results  
-![Redshift Analytics](./screenshots/redshift_query_results.png)  
+# Write transformed data to Redshift
+redshift_query = transformed_df.writeStream \
+    .format("jdbc") \
+    .option("url", "jdbc:redshift://your-redshift-cluster-url:5439/dev") \
+    .option("dbtable", "public.login_events") \
+    .option("user", "your_username") \
+    .option("password", "your_password") \
+    .outputMode("append") \
+    .start()
 
----
-
-## 🌱 Key Learnings  
-- Building scalable real-time ETL pipelines with open-source tools  
-- Handling JSON data ingestion and transformation in streaming workflows  
-- Integrating NoSQL and data warehouse storage for different analytics needs  
-- Writing performant Spark Structured Streaming jobs  
-- Querying large datasets efficiently in AWS Redshift  
-
----
-
-## Author  
-Sachin.C  
-Data Engineering Enthusiast  
-[LinkedIn](https://www.linkedin.com/in/yourprofile) | [GitHub](https://github.com/yourusername)
-
+# Await termination
+mongo_query.awaitTermination()
+redshift_query.awaitTermination()
