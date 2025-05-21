@@ -21,64 +21,175 @@ This project implements a real-time streaming ETL pipeline to ingest, process, a
 
 ---
 
-## 🔨 Implementation Steps  
+## 🔨 Pipeline Deep Dive 
 
-### Step 1: Kafka Data Producer  
+### 1: Kafka Data Producer  
 Simulate and send real-time events to Kafka.
+**Code**: `kafka_producer.py`
+```python
+# Key Features:
+# - Circular reading for infinite streaming
+# - Error handling and graceful shutdown
 
-### Step 2: Spark Structured Streaming ETL  
+import json
+from kafka import KafkaProducer
+
+producer = KafkaProducer(
+    bootstrap_servers='localhost:9092',
+    value_serializer=lambda v: json.dumps(v).encode('utf-8')
+)
+
+with open("UserActivity.json") as f:
+    records = json.load(f)  # Sample data: 1000+ user activities
+
+while True:
+    for record in records:
+        try:
+            producer.send('user_activity_topic', record)
+            print(f"Sent: {record['email'][:5]}...")  # Truncate PII
+            time.sleep(0.5)  # Simulate real-time
+        except Exception as e:
+            print(f"Error: {e}")
+            break
+```
+
+**Producer**
+![Screenshot from 2025-05-21 13-02-44](https://github.com/user-attachments/assets/3653b0eb-6ec8-413c-b989-96b0927b785f)
+
+**Consumer**
+![image](https://github.com/user-attachments/assets/8ad98d4e-68b2-456c-a459-7de9e0560e6b)
+
+### 2: Spark Structured Streaming ETL  
 
 ```python
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import from_json, col
-from pyspark.sql.types import StructType, StructField, StringType, TimestampType
+from pyspark.sql.functions import col, from_json, to_timestamp, current_timestamp, window, hour
+from pyspark.sql.types import StructType, StructField, StringType
 
-# Initialize SparkSession
+from pyspark.sql import SparkSession
+
 spark = SparkSession.builder \
-    .appName("StreamingETLPipeline") \
+    .appName("KafkaToMongoAndRedshift") \
+    .config("spark.jars.packages",
+            "org.mongodb.spark:mongo-spark-connector_2.12:3.0.1,"
+            "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0") \
+    .config("spark.jars", "/home/sachin/Downloads/redshift-jdbc42-2.1.0.32/redshift-jdbc42-2.1.0.32.jar") \
+    .config("spark.mongodb.write.connection.uri", "mongodb://127.0.0.1/") \
     .getOrCreate()
 
-# Define schema for incoming JSON
-schema = StructType([
-    StructField("user_id", StringType()),
-    StructField("activity_type", StringType()),
-    StructField("device", StringType()),
-    StructField("timestamp", TimestampType())
-])
-
-# Read data from Kafka
+# Kafka stream
 kafka_df = spark.readStream \
     .format("kafka") \
     .option("kafka.bootstrap.servers", "localhost:9092") \
-    .option("subscribe", "user_activity") \
-    .option("startingOffsets", "latest") \
+    .option("subscribe", "user_activity_topic") \
+    .option("startingOffsets", "earliest") \
     .load()
+    
+# Define schema for incoming Kafka messages
+schema = StructType([
+    StructField("id", StringType(), True),
+    StructField("activity", StringType(), True),
+    StructField("timestamp", StringType(), True),  
+    StructField("email", StringType(), True),
+    StructField("gender", StringType(), True),
+    StructField("device", StringType(), True),
+    StructField("user_ip", StringType(), True),
+    StructField("session_id", StringType(), True),
+    StructField("user_agent", StringType(), True),
+    StructField("location", StringType(), True)
+])
 
-# Parse JSON from Kafka message value
+# Parse JSON value
 parsed_df = kafka_df.selectExpr("CAST(value AS STRING)") \
-    .select(from_json(col("value"), schema).alias("data")) \
-    .select("data.*")
+    .withColumn("parsed", from_json(col("value"), schema)) \
+    .select("parsed.*") \
+    .withColumn("activity_time", to_timestamp(col("timestamp"), "yyyy-MM-dd HH:mm:ss")) \
+    .withColumn("processing_time", current_timestamp()) \
+    .filter(col("activity").isNotNull() & (col("activity") != ""))
 
-# Example transformation: keep only login events
-transformed_df = parsed_df.filter(col("activity_type") == "login")
+# Convert 'timestamp' string to proper timestamp format
+parsed_df = parsed_df.withColumn("activity_time", to_timestamp(col("timestamp"), "yyyy-MM-dd HH:mm:ss"))
 
-# Write transformed data to MongoDB
-mongo_query = transformed_df.writeStream \
-    .format("mongodb") \
-    .option("uri", "mongodb://localhost:27017/streamingdb.login_events") \
-    .outputMode("append") \
-    .start()
+# Add a new column for when Spark processes the event
+parsed_df = parsed_df.withColumn("processing_time", current_timestamp())
 
-# Write transformed data to Redshift
-redshift_query = transformed_df.writeStream \
-    .format("jdbc") \
-    .option("url", "jdbc:redshift://your-redshift-cluster-url:5439/dev") \
-    .option("dbtable", "public.login_events") \
-    .option("user", "your_username") \
-    .option("password", "your_password") \
-    .outputMode("append") \
-    .start()
+# Filter out rows with null or empty activity
+parsed_df = parsed_df.filter(col("activity").isNotNull() & (col("activity") != ""))
+
+# Normalize email addresses for consistent grouping
+from pyspark.sql.functions import col, lower, trim
+
+parsed_df = parsed_df.withColumn("email", lower(trim(col("email"))))
+
+# Flag local or empty IPs for debugging or filtering
+parsed_df = parsed_df.withColumn(
+    "is_valid_ip",
+    (col("user_ip").isNotNull()) & (~col("user_ip").like("127.%")) & (col("user_ip") != "")
+)
+
+
+```
+### 3: MongoDB sink
+```python
+from pymongo import MongoClient
+from pyspark.sql.streaming import StreamingQuery
+from pyspark.sql import Row
+
+# MongoDB writer for raw data
+class MongoDBForeachWriter:
+    def __init__(self, db_name, collection_name):
+        self.client = None
+        self.db_name = db_name
+        self.collection_name = collection_name
+
+    def open(self, partition_id, epoch_id):
+        """Establish MongoDB connection for each partition"""
+        self.client = MongoClient("mongodb://localhost:27017/")
+        return True
+
+    def process(self, row: Row):
+        """Insert row into MongoDB"""
+        data = row.asDict()
+        print(f"Inserting row into MongoDB: {data}")
+        self.client[self.db_name][self.collection_name].insert_one(data)
+
+    def close(self, error):
+        """Close MongoDB connection"""
+        if self.client:
+            self.client.close()
 
 # Await termination
 mongo_query.awaitTermination()
+```
+
+### 4: Redshift sink
+```python
+
+
+import os
+
+# Redshift connection details
+redshift_url = "jdbc:redshift://user-activity.876820567780.ap-southeast-2.redshift-serverless.amazonaws.com:5439/dev"
+redshift_properties = {
+    "user": os.environ.get("REDSHIFT_USER"),
+    "password": os.environ.get("REDSHIFT_PASSWORD"),
+    "driver": "com.amazon.redshift.jdbc42.Driver"
+}
+
+# Write to Redshift using foreachBatch
+def write_to_redshift(batch_df, batch_id):
+    batch_df.write \
+        .jdbc(url=redshift_url,
+              table=redshift_table,
+              mode="append",
+              properties=redshift_properties)
+
+redshift_query = parsed_df.writeStream \
+    .foreachBatch(write_to_redshift) \
+    .outputMode("append") \
+    .option("checkpointLocation", "/tmp/portfolio_checkpoints/user_activity_redshift") \
+    .start()
+
+#Await termination
 redshift_query.awaitTermination()
+```
